@@ -8,14 +8,14 @@ use std::net::SocketAddr;
 use std::collections::{HashMap,HashSet};
 use std::io::{self,Error,ErrorKind,Read};
 
-use certificate::split_certificate_chain;
+use crate::certificate::split_certificate_chain;
 use toml;
 
-use proxy::{CertificateAndKey,ProxyRequestData,HttpFront,TcpFront,Backend,
+use crate::proxy::{CertificateAndKey,ProxyRequestData,HttpFront,TcpFront,Backend,
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
-  Application, TlsVersion,ActivateListener,ListenerType};
+  LoadMetric, Application, TlsVersion,ActivateListener,ListenerType};
 
-use command::{CommandRequestData,CommandRequest,PROTOCOL_VERSION};
+use crate::command::{CommandRequestData,CommandRequest,PROTOCOL_VERSION};
 
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -35,6 +35,9 @@ pub struct Listener {
   pub certificate:        Option<String>,
   pub certificate_chain:  Option<String>,
   pub key:                Option<String>,
+  pub front_timeout:      Option<u32>,
+  pub back_timeout:       Option<u32>,
+  pub connect_timeout:    Option<u32>,
 }
 
 fn default_sticky_name() -> String {
@@ -57,10 +60,13 @@ impl Listener {
       certificate:        None,
       certificate_chain:  None,
       key:                None,
+      front_timeout:      None,
+      back_timeout:       None,
+      connect_timeout:    None,
     }
   }
 
-  pub fn to_http(&self) -> Option<HttpListener> {
+  pub fn to_http(&self, front_timeout: Option<u32>, back_timeout: Option<u32>, connect_timeout: Option<u32>) -> Option<HttpListener> {
     if self.protocol != FileListenerProtocolConfig::Http {
       error!("cannot convert listener to HTTP");
       return None;
@@ -87,6 +93,9 @@ impl Listener {
         public_address: self.public_address,
         expect_proxy:   self.expect_proxy.unwrap_or(false),
         sticky_name:    self.sticky_name.clone(),
+        front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
+        back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
+        connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
         ..Default::default()
       };
 
@@ -109,7 +118,7 @@ impl Listener {
     })
   }
 
-  pub fn to_tls(&self) -> Option<HttpsListener> {
+  pub fn to_tls(&self, front_timeout: Option<u32>, back_timeout: Option<u32>, connect_timeout: Option<u32>) -> Option<HttpsListener> {
     if self.protocol != FileListenerProtocolConfig::Https {
       error!("cannot convert listener to HTTPS");
       return None;
@@ -187,6 +196,9 @@ impl Listener {
         key,
         certificate,
         certificate_chain,
+        front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
+        back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
+        connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
         ..Default::default()
       };
 
@@ -212,7 +224,7 @@ impl Listener {
     })
   }
 
-  pub fn to_tcp(&self) -> Option<TcpListener> {
+  pub fn to_tcp(&self, front_timeout: Option<u32>, back_timeout: Option<u32>, connect_timeout: Option<u32>) -> Option<TcpListener> {
     /*let mut address = self.address.clone();
     address.push(':');
     address.push_str(&self.port.to_string());
@@ -233,6 +245,9 @@ impl Listener {
         front:          addr,
         public_address: self.public_address,
         expect_proxy:   self.expect_proxy.unwrap_or(false),
+        front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
+        back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
+        connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
       }
     })
 
@@ -294,7 +309,7 @@ impl FileAppFrontendConfig {
     })
   }
 
-  pub fn to_http_front(&self, app_id: &str) -> Result<HttpFrontendConfig, String> {
+  pub fn to_http_front(&self, _app_id: &str) -> Result<HttpFrontendConfig, String> {
     if self.hostname.is_none() {
       return Err(String::from("HTTP frontend should have a 'hostname' field"));
     }
@@ -343,24 +358,27 @@ pub enum FileAppProtocolConfig {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileAppConfig {
-  pub frontends:             Vec<FileAppFrontendConfig>,
-  pub backends:              Vec<BackendConfig>,
-  pub protocol:              FileAppProtocolConfig,
-  pub sticky_session:        Option<bool>,
-  pub https_redirect:        Option<bool>,
+  pub frontends: Vec<FileAppFrontendConfig>,
+  pub backends: Vec<BackendConfig>,
+  pub protocol: FileAppProtocolConfig,
+  pub sticky_session: Option<bool>,
+  pub https_redirect: Option<bool>,
   #[serde(default)]
-  pub send_proxy:            Option<bool>,
+  pub send_proxy: Option<bool>,
   #[serde(default)]
-  pub load_balancing_policy: LoadBalancingAlgorithms,
-  pub answer_503:            Option<String>,
+  pub load_balancing: LoadBalancingAlgorithms,
+  pub answer_503: Option<String>,
+  #[serde(default)]
+  pub load_metric: Option<LoadMetric>,
 }
 
 #[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum LoadBalancingAlgorithms {
   RoundRobin,
   Random,
-  LeastConnections,
+  LeastLoaded,
+  PowerOfTwo,
 }
 
 impl Default for LoadBalancingAlgorithms {
@@ -383,7 +401,7 @@ impl error::Error for ParseErrorLoadBalancing {
         "Cannot find the load balancing policy asked"
     }
 
-    fn cause(&self) -> Option<&error::Error> {
+    fn cause(&self) -> Option<&dyn error::Error> {
         None
     }
 }
@@ -448,11 +466,12 @@ impl FileAppConfig {
         };
 
         Ok(AppConfig::Tcp(TcpAppConfig {
-          app_id:         app_id.to_string(),
+          app_id: app_id.to_string(),
           frontends,
-          backends:       self.backends,
+          backends: self.backends,
           proxy_protocol,
-          load_balancing_policy: self.load_balancing_policy,
+          load_balancing: self.load_balancing,
+          load_metric: self.load_metric,
         }))
       },
       FileAppProtocolConfig::Http => {
@@ -470,12 +489,13 @@ impl FileAppConfig {
         }).ok());
 
         Ok(AppConfig::Http(HttpAppConfig {
-          app_id:            app_id.to_string(),
+          app_id: app_id.to_string(),
           frontends,
-          backends:          self.backends,
-          sticky_session:    self.sticky_session.unwrap_or(false),
-          https_redirect:    self.https_redirect.unwrap_or(false),
-          load_balancing_policy: self.load_balancing_policy,
+          backends: self.backends,
+          sticky_session: self.sticky_session.unwrap_or(false),
+          https_redirect: self.https_redirect.unwrap_or(false),
+          load_balancing: self.load_balancing,
+          load_metric: self.load_metric,
           answer_503,
         }))
       }
@@ -536,13 +556,14 @@ impl HttpFrontendConfig {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpAppConfig {
-  pub app_id:            String,
-  pub frontends:         Vec<HttpFrontendConfig>,
-  pub backends:          Vec<BackendConfig>,
-  pub sticky_session:    bool,
-  pub https_redirect:    bool,
-  pub load_balancing_policy: LoadBalancingAlgorithms,
-  pub answer_503:        Option<String>,
+  pub app_id: String,
+  pub frontends: Vec<HttpFrontendConfig>,
+  pub backends: Vec<BackendConfig>,
+  pub sticky_session: bool,
+  pub https_redirect: bool,
+  pub load_balancing: LoadBalancingAlgorithms,
+  pub load_metric: Option<LoadMetric>,
+  pub answer_503: Option<String>,
 }
 
 impl HttpAppConfig {
@@ -554,8 +575,9 @@ impl HttpAppConfig {
       sticky_session: self.sticky_session,
       https_redirect: self.https_redirect,
       proxy_protocol: None,
-      load_balancing_policy: self.load_balancing_policy,
+      load_balancing: self.load_balancing,
       answer_503: self.answer_503.clone(),
+      load_metric: self.load_metric.clone(),
     }));
 
     for frontend in &self.frontends {
@@ -592,12 +614,13 @@ pub struct TcpFrontendConfig {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct TcpAppConfig {
-  pub app_id:            String,
-  pub frontends:         Vec<TcpFrontendConfig>,
-  pub backends:          Vec<BackendConfig>,
+  pub app_id: String,
+  pub frontends: Vec<TcpFrontendConfig>,
+  pub backends: Vec<BackendConfig>,
   #[serde(default)]
-  pub proxy_protocol:    Option<ProxyProtocolConfig>,
-  pub load_balancing_policy: LoadBalancingAlgorithms,
+  pub proxy_protocol: Option<ProxyProtocolConfig>,
+  pub load_balancing: LoadBalancingAlgorithms,
+  pub load_metric: Option<LoadMetric>,
 }
 
 impl TcpAppConfig {
@@ -609,7 +632,8 @@ impl TcpAppConfig {
       sticky_session: false,
       https_redirect: false,
       proxy_protocol: self.proxy_protocol.clone(),
-      load_balancing_policy: self.load_balancing_policy,
+      load_balancing: self.load_balancing,
+      load_metric: self.load_metric.clone(),
       answer_503: None,
     }));
 
@@ -663,6 +687,7 @@ pub struct FileConfig {
   pub command_buffer_size:      Option<usize>,
   pub max_command_buffer_size:  Option<usize>,
   pub max_connections:          Option<usize>,
+  pub min_buffers:              Option<usize>,
   pub max_buffers:              Option<usize>,
   pub buffer_size:              Option<usize>,
   pub saved_state:              Option<String>,
@@ -684,6 +709,10 @@ pub struct FileConfig {
   pub activate_listeners:       Option<bool>,
   #[serde(default)]
   pub front_timeout:            Option<u32>,
+  #[serde(default)]
+  pub back_timeout:             Option<u32>,
+  #[serde(default)]
+  pub connect_timeout:          Option<u32>,
   #[serde(default)]
   pub zombie_check_interval:    Option<u32>,
   #[serde(default)]
@@ -772,21 +801,21 @@ impl FileConfig {
 
         match listener.protocol {
           FileListenerProtocolConfig::Https => {
-            if let Some(l) = listener.to_tls() {
+            if let Some(l) = listener.to_tls(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()) {
               https_listeners.push(l);
             } else {
               panic!("invalid listener");
             }
           },
           FileListenerProtocolConfig::Http => {
-            if let Some(l) = listener.to_http() {
+            if let Some(l) = listener.to_http(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()) {
               http_listeners.push(l);
             } else {
               panic!("invalid listener");
             }
           },
           FileListenerProtocolConfig::Tcp => {
-            if let Some(l) = listener.to_tcp() {
+            if let Some(l) = listener.to_tcp(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()) {
               tcp_listeners.push(l);
             } else {
               panic!("invalid listener");
@@ -823,12 +852,12 @@ impl FileConfig {
                       // create a default listener for that front
                       let p = if frontend.certificate.is_some() {
                         let listener = Listener::new(frontend.address, FileListenerProtocolConfig::Https);
-                        https_listeners.push(listener.to_tls().unwrap());
+                        https_listeners.push(listener.to_tls(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()).unwrap());
 
                         FileListenerProtocolConfig::Https
                       } else {
                         let listener = Listener::new(frontend.address, FileListenerProtocolConfig::Http);
-                        http_listeners.push(listener.to_http().unwrap());
+                        http_listeners.push(listener.to_http(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()).unwrap());
 
                         FileListenerProtocolConfig::Http
                       };
@@ -848,7 +877,7 @@ impl FileConfig {
                     None => {
                       // create a default listener for that front
                       let listener = Listener::new(frontend.address, FileListenerProtocolConfig::Tcp);
-                      tcp_listeners.push(listener.to_tcp().unwrap());
+                      tcp_listeners.push(listener.to_tcp(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()).unwrap());
                       known_addresses.insert(frontend.address, FileListenerProtocolConfig::Tcp);
                     },
                   }
@@ -888,6 +917,7 @@ impl FileConfig {
       command_buffer_size: self.command_buffer_size.unwrap_or(1_000_000),
       max_command_buffer_size: self.max_command_buffer_size.unwrap_or( self.command_buffer_size.unwrap_or(1_000_000) * 2),
       max_connections: self.max_connections.unwrap_or(10000),
+      min_buffers: std::cmp::min(self.min_buffers.unwrap_or(1), self.max_buffers.unwrap_or(1000)),
       max_buffers: self.max_buffers.unwrap_or(1000),
       buffer_size: self.buffer_size.unwrap_or(16384),
       saved_state: self.saved_state,
@@ -908,8 +938,10 @@ impl FileConfig {
       tls_provider,
       activate_listeners: self.activate_listeners.unwrap_or(true),
       front_timeout: self.front_timeout.unwrap_or(60),
+      back_timeout: self.front_timeout.unwrap_or(30),
+      connect_timeout: self.front_timeout.unwrap_or(3),
       //defaults to 30mn
-      zombie_check_interval: self.front_timeout.unwrap_or(30 * 60),
+      zombie_check_interval: self.zombie_check_interval.unwrap_or(30 * 60),
       accept_queue_timeout: self.accept_queue_timeout.unwrap_or(60),
     }
   }
@@ -922,6 +954,7 @@ pub struct Config {
   pub command_buffer_size:      usize,
   pub max_command_buffer_size:  usize,
   pub max_connections:          usize,
+  pub min_buffers:              usize,
   pub max_buffers:              usize,
   pub buffer_size:              usize,
   pub saved_state:              Option<String>,
@@ -945,6 +978,10 @@ pub struct Config {
   pub activate_listeners:       bool,
   #[serde(default = "default_front_timeout")]
   pub front_timeout:            u32,
+  #[serde(default = "default_back_timeout")]
+  pub back_timeout:            u32,
+  #[serde(default = "default_connect_timeout")]
+  pub connect_timeout:            u32,
   #[serde(default = "default_zombie_check_interval")]
   pub zombie_check_interval:    u32,
   #[serde(default = "default_accept_queue_timeout")]
@@ -953,6 +990,14 @@ pub struct Config {
 
 fn default_front_timeout() -> u32 {
   60
+}
+
+fn default_back_timeout() -> u32 {
+  30
+}
+
+fn default_connect_timeout() -> u32 {
+  3
 }
 
 //defaults to 30mn
@@ -1141,6 +1186,9 @@ mod tests {
       certificate:        None,
       certificate_chain:  None,
       key:                None,
+      front_timeout: None,
+      back_timeout: None,
+      connect_timeout: None,
     };
     println!("http: {:?}", to_string(&http));
     let https = Listener {
@@ -1157,6 +1205,9 @@ mod tests {
       certificate:        None,
       certificate_chain:  None,
       key:                None,
+      front_timeout: None,
+      back_timeout: None,
+      connect_timeout: None,
     };
     println!("https: {:?}", to_string(&https));
 
@@ -1173,6 +1224,7 @@ mod tests {
       handle_process_affinity: None,
       command_buffer_size: None,
       max_connections: Some(500),
+      min_buffers: Some(1),
       max_buffers: Some(500),
       buffer_size: Some(16384),
       max_command_buffer_size: None,
@@ -1191,6 +1243,8 @@ mod tests {
       tls_provider: None,
       activate_listeners: None,
       front_timeout: None,
+      back_timeout: None,
+      connect_timeout: None,
       zombie_check_interval: None,
       accept_queue_timeout: None,
     };

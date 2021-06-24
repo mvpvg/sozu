@@ -14,7 +14,7 @@ pub struct MetricSocket {
 
 impl Write for MetricSocket {
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-    self.socket.send_to(buf, &self.addr)
+    self.socket.send_to(buf, self.addr)
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -179,7 +179,7 @@ impl MetricsWriter {
                     self.packet_indexes.clear();
                     break;
                   } else {
-                    for i in 0..(sent as usize) {
+                    for _i in 0..(sent as usize) {
                       let _ = self.packet_indexes.remove(0);
                     }
                   }

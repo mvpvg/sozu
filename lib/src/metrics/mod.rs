@@ -148,6 +148,10 @@ impl Aggregator {
     self.network.as_ref().map(|n| &n.remote.get_ref().socket)
   }
 
+  pub fn socket_mut(&mut self) -> Option<&mut UdpSocket> {
+    self.network.as_mut().map(|n| &mut n.remote.get_mut().socket)
+  }
+
   pub fn count_add(&mut self, key: &'static str, count_value: i64) {
     self.receive_metric(key, None, None, MetricData::Count(count_value));
   }
@@ -211,7 +215,7 @@ pub struct MetricSocket {
 
 impl Write for MetricSocket {
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-    self.socket.send_to(buf, &self.addr)
+    self.socket.send_to(buf, self.addr)
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -220,7 +224,7 @@ impl Write for MetricSocket {
 }
 
 pub fn udp_bind() -> UdpSocket {
-  UdpSocket::bind(&("0.0.0.0:0".parse().unwrap())).expect("could not parse address")
+  UdpSocket::bind("0.0.0.0:0".parse().unwrap()).expect("could not parse address")
 }
 
 #[macro_export]
@@ -280,7 +284,7 @@ macro_rules! gauge_add (
 
 #[macro_export]
 macro_rules! time (
-  ($key:expr, $value: expr) => {
+  ($key:expr, $value: expr) => ({
     use $crate::metrics::{MetricData,Subscriber};
     let v = $value;
     $crate::metrics::METRICS.with(|metrics| {
@@ -288,7 +292,7 @@ macro_rules! time (
 
       m.receive_metric($key, None, None, MetricData::Time(v as usize));
     });
-  };
+  });
   ($key:expr, $app_id:expr, $value: expr) => ({
     use $crate::metrics::{MetricData,Subscriber};
     let v = $value;
@@ -312,9 +316,9 @@ macro_rules! record_backend_metrics (
 
       m.receive_metric("bytes_in", Some(app_id), Some(backend_id), MetricData::Count($bin as i64));
       m.receive_metric("bytes_out", Some(app_id), Some(backend_id), MetricData::Count($bout as i64));
-      m.receive_metric("response_time", Some(app_id), Some(backend_id), MetricData::Time($response_time as usize));
+      m.receive_metric("backend_response_time", Some(app_id), Some(backend_id), MetricData::Time($response_time as usize));
       if let Some(t) = $backend_connection_time {
-        m.receive_metric("connection_time", Some(app_id), Some(backend_id), MetricData::Time(t.whole_milliseconds() as usize));
+        m.receive_metric("backend_connection_time", Some(app_id), Some(backend_id), MetricData::Time(t.whole_milliseconds() as usize));
       }
     });
   }

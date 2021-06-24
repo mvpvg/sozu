@@ -1,11 +1,10 @@
-use mio::*;
 use mio::net::*;
-use mio::unix::UnixReady;
 use rusty_ulid::Ulid;
 use std::io::ErrorKind;
 use {SessionResult,Readiness};
 use protocol::ProtocolResult;
 use rustls::{ServerSession, Session};
+use Ready;
 
 pub enum TlsState {
   Initial,
@@ -27,9 +26,8 @@ impl TlsHandshake {
       stream,
       session,
       readiness: Readiness {
-        interest:  UnixReady::from(Ready::readable())
-                           | UnixReady::hup() | UnixReady::error(),
-        event: UnixReady::from(Ready::empty()),
+        interest: Ready::readable() | Ready::hup() | Ready::error(),
+        event: Ready::empty(),
       },
       request_id,
     }

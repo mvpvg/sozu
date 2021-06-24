@@ -1006,7 +1006,7 @@ pub fn reload_configuration(mut channel: Channel<CommandRequest,CommandResponse>
   }
 }
 
-pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing_policy: LoadBalancingAlgorithms) {
+pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing: LoadBalancingAlgorithms) {
   let proxy_protocol = match (send_proxy, expect_proxy) {
     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
     (true, false) => Some(ProxyProtocolConfig::SendHeader),
@@ -1019,7 +1019,8 @@ pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout
     sticky_session,
     https_redirect,
     proxy_protocol,
-    load_balancing_policy,
+    load_balancing,
+    load_metric: None,
     answer_503: None,
   }));
 }
@@ -1195,7 +1196,7 @@ pub fn add_http_listener(channel: Channel<CommandRequest,CommandResponse>, timeo
     listener.sticky_name = sticky_name;
   }
 
-  match listener.to_http() {
+  match listener.to_http(None, None, None) {
     Some(conf) => order_command(channel, timeout, ProxyRequestData::AddHttpListener(conf)),
     None => eprintln!("Error creating HTTP listener")
   };
@@ -1216,7 +1217,7 @@ pub fn add_https_listener(channel: Channel<CommandRequest,CommandResponse>, time
   listener.tls_versions = if tls_versions.len() == 0 { None } else { Some(tls_versions) };
   listener.rustls_cipher_list = if rustls_cipher_list.len() == 0 { None } else { Some(rustls_cipher_list) };
 
-  match listener.to_tls() {
+  match listener.to_tls(None, None, None) {
     Some(conf) => order_command(channel, timeout, ProxyRequestData::AddHttpsListener(conf)),
     None => eprintln!("Error creating HTTPS listener")
   };
@@ -1227,7 +1228,10 @@ pub fn add_tcp_listener(channel: Channel<CommandRequest,CommandResponse>, timeou
   order_command(channel, timeout, ProxyRequestData::AddTcpListener(TcpListener {
     front: address,
     public_address,
-    expect_proxy
+    expect_proxy,
+    front_timeout: 60,
+    back_timeout: 30,
+    connect_timeout: 3,
   }));
 }
 

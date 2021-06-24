@@ -2,19 +2,6 @@
 #[macro_use] extern crate clap;
 #[macro_use] extern crate serde_derive;
 #[macro_use] extern crate lazy_static;
-extern crate mio;
-extern crate mio_uds;
-extern crate serde_json;
-extern crate time;
-extern crate libc;
-extern crate slab;
-extern crate rand;
-extern crate nix;
-extern crate tempfile;
-extern crate futures;
-extern crate regex;
-#[cfg(feature = "jemallocator")]
-extern crate jemallocator;
 #[macro_use] extern crate sozu_lib as sozu;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
 
@@ -27,14 +14,15 @@ use regex::Regex;
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+#[macro_use]
+mod logging;
+
 mod command;
 mod worker;
-mod logging;
 mod upgrade;
-mod util;
 mod cli;
+mod util;
 
-use std::env;
 use std::panic;
 use sozu_command::config::Config;
 use clap::ArgMatches;
@@ -42,8 +30,8 @@ use clap::ArgMatches;
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t,pid_t};
 
-use command::Worker;
-use worker::{start_workers,get_executable_path};
+use crate::command::Worker;
+use crate::worker::{start_workers,get_executable_path};
 use sozu::metrics::METRICS;
 
 enum StartupError {
@@ -88,7 +76,9 @@ fn main() {
         set_workers_affinity(&workers);
       }
       let command_socket_path = config.command_socket_path();
-      command::start(config, command_socket_path, workers);
+      if let Err(e) = command::start(config, command_socket_path, workers) {
+          error!("could not start worker: {:?}", e);
+      }
     });
 
     match start {

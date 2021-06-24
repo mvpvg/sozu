@@ -3,8 +3,7 @@ use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::net::{SocketAddr,IpAddr};
 use mio::*;
-use mio::unix::UnixReady;
-use mio::tcp::TcpStream;
+use mio::net::TcpStream;
 use rusty_ulid::Ulid;
 use time::{Instant, Duration};
 use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
@@ -13,6 +12,9 @@ use socket::{SocketHandler, SocketResult, TransportProtocol};
 use protocol::ProtocolResult;
 use pool::Pool;
 use util::UnwrapLog;
+use timer::TimeoutContainer;
+use sozu_command::ready::Ready;
+use crate::Backend;
 
 pub mod parser;
 pub mod cookies;
@@ -59,6 +61,7 @@ pub enum TimeoutStatus {
   Request,
   Response,
   WaitingForNewRequest,
+  WaitingForResponse,
 }
 
 pub struct Http<Front:SocketHandler> {
@@ -76,7 +79,7 @@ pub struct Http<Front:SocketHandler> {
   pub back_readiness: Readiness,
   pub public_address: SocketAddr,
   pub session_address: Option<SocketAddr>,
-  pub backend_address: Option<SocketAddr>,
+  pub backend_data:   Option<Rc<RefCell<Backend>>>,
   pub sticky_name:    String,
   pub sticky_session: Option<StickySession>,
   pub protocol:       Protocol,
@@ -88,14 +91,20 @@ pub struct Http<Front:SocketHandler> {
   pub added_res_header: String,
   pub keepalive_count: usize,
   pub backend_stop:    Option<Instant>,
+  answers:             Rc<RefCell<answers::HttpAnswers>>,
   pub closing:         bool,
   pool:                Weak<RefCell<Pool>>,
+  pub front_timeout:   TimeoutContainer,
+  pub back_timeout:    TimeoutContainer,
+  pub frontend_timeout_duration: Duration,
 }
 
 impl<Front:SocketHandler> Http<Front> {
   pub fn new(sock: Front, token: Token, request_id: Ulid, pool: Weak<RefCell<Pool>>,
     public_address: SocketAddr, session_address: Option<SocketAddr>, sticky_name: String,
-    protocol: Protocol) -> Http<Front> {
+    protocol: Protocol, answers: Rc<RefCell<answers::HttpAnswers>>,
+    front_timeout: TimeoutContainer,
+    frontend_timeout_duration: Duration, backend_timeout_duration: Duration) -> Http<Front> {
 
     let mut session = Http {
       frontend:           sock,
@@ -112,7 +121,7 @@ impl<Front:SocketHandler> Http<Front> {
       back_readiness:     Readiness::new(),
       public_address,
       session_address,
-      backend_address:    None,
+      backend_data: None,
       sticky_name,
       sticky_session:     None,
       protocol,
@@ -125,9 +134,13 @@ impl<Front:SocketHandler> Http<Front> {
       keepalive_count: 0,
       backend_stop:    None,
       closing:         false,
+      front_timeout,
+      back_timeout: TimeoutContainer::new_empty(backend_timeout_duration),
+      frontend_timeout_duration,
+      answers,
       pool,
     };
-    session.added_req_header = Some(session.added_request_header(public_address, session_address));
+    session.added_req_header = Some(session.added_request_header(session_address));
     session.added_res_header = session.added_response_header();
 
     session
@@ -142,7 +155,7 @@ impl<Front:SocketHandler> Http<Front> {
     self.response = Some(ResponseState::Initial);
     self.req_header_end = None;
     self.res_header_end = None;
-    self.added_req_header = Some(self.added_request_header(self.public_address, self.session_address));
+    self.added_req_header = Some(self.added_request_header(self.session_address));
     self.added_res_header = self.added_response_header();
 
     // if HTTP requests are pipelined, we might still have some data in the front buffer
@@ -155,6 +168,16 @@ impl<Front:SocketHandler> Http<Front> {
     self.back_buf = None;
     self.request_id = request_id;
     self.keepalive_count += 1;
+
+    if let Some(ref mut b) = self.backend_data {
+      let mut backend = b.borrow_mut();
+      backend.active_requests = backend.active_requests.saturating_sub(1);
+    }
+
+    // reset the front timeout and cancel the back timeout while we are
+    // waiting for a new request
+    self.front_timeout.reset();
+    self.back_timeout.cancel();
   }
 
   pub fn log_context(&self) -> LogContext {
@@ -177,7 +200,7 @@ impl<Front:SocketHandler> Http<Front> {
       prefix, self.request, self.req_header_end, self.response, self.res_header_end)
   }
 
-  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Rc<Vec<u8>>)  {
+  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>)  {
     self.front_buf = None;
     self.back_buf = None;
 
@@ -196,13 +219,14 @@ impl<Front:SocketHandler> Http<Front> {
       };
     }
 
+    let buf = buf.unwrap_or_else(|| self.answers.borrow().get(answer, self.app_id.as_deref()));
     self.status = SessionStatus::DefaultAnswer(answer, buf, 0);
-    self.front_readiness.interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-    self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
+    self.front_readiness.interest = Ready::writable() | Ready::hup() | Ready::error();
+    self.back_readiness.interest  = Ready::hup() | Ready::error();
 
   }
 
-  pub fn added_request_header(&self, public_address: SocketAddr, client_address: Option<SocketAddr>) -> AddedRequestHeader {
+  fn added_request_header(&self, client_address: Option<SocketAddr>) -> AddedRequestHeader {
       AddedRequestHeader {
           request_id: self.request_id,
           closing: self.closing,
@@ -224,8 +248,16 @@ impl<Front:SocketHandler> Http<Front> {
     self.frontend.socket_ref()
   }
 
+  pub fn front_socket_mut(&mut self) -> &mut TcpStream {
+    self.frontend.socket_mut()
+  }
+
   pub fn back_socket(&self)  -> Option<&TcpStream> {
     self.backend.as_ref()
+  }
+
+  pub fn back_socket_mut(&mut self)  -> Option<&mut TcpStream> {
+    self.backend.as_mut()
   }
 
   pub fn back_token(&self)   -> Option<Token> {
@@ -271,9 +303,9 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn close(&mut self) {
   }
 
-  pub fn set_back_socket(&mut self, socket: TcpStream, address: SocketAddr) {
+  pub fn set_back_socket(&mut self, socket: TcpStream, backend: Option<Rc<RefCell<Backend>>>) {
     self.backend = Some(socket);
-    self.backend_address = Some(address);
+    self.backend_data = backend;
   }
 
   pub fn set_app_id(&mut self, app_id: String) {
@@ -300,12 +332,19 @@ impl<Front:SocketHandler> Http<Front> {
     &mut self.back_readiness
   }
 
+  pub fn set_back_timeout(&mut self, dur: Duration) {
+      if let Some(token) = self.backend_token.as_ref() {
+          self.back_timeout.set_duration(dur);
+          self.back_timeout.set(*token);
+      }
+  }
+
   fn protocol(&self) -> Protocol {
     self.protocol
   }
 
   fn must_continue_request(&self) -> bool {
-    if let Some(Continue::Expects(sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().as_ref().map(|conn| conn.continues)) {
+    if let Some(Continue::Expects(_sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().as_ref().map(|conn| conn.continues)) {
       true
     } else {
       false
@@ -325,7 +364,10 @@ impl<Front:SocketHandler> Http<Front> {
     match self.request.as_ref() {
       Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) |
         Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
-          TimeoutStatus::Response
+          match self.response.as_ref() {
+            Some(ResponseState::Initial) => TimeoutStatus::WaitingForResponse,
+            _ => TimeoutStatus::Response,
+          }
       },
       _ => if self.keepalive_count > 0 {
         TimeoutStatus::WaitingForNewRequest
@@ -339,6 +381,7 @@ impl<Front:SocketHandler> Http<Front> {
     debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_context(), self.frontend_token.0,
       self.backend_token.map(|t| format!("{}", t.0)).unwrap_or_else(|| "-".to_string()));
     let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
+    self.cancel_backend_timeout();
     self.backend       = None;
     self.backend_token = None;
     (self.app_id.clone(), addr)
@@ -356,10 +399,9 @@ impl<Front:SocketHandler> Http<Front> {
           self.back_readiness.interest.insert(Ready::readable());
           SessionResult::Continue
         } else {
-          let answer_502 = "HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-          self.set_answer(DefaultAnswerStatus::Answer502, Rc::new(Vec::from(answer_502.as_bytes())));
+          self.set_answer(DefaultAnswerStatus::Answer502, None);
           // we're not expecting any more data from the backend
-          self.back_readiness.interest  = UnixReady::from(Ready::empty());
+          self.back_readiness.interest  = Ready::empty();
           SessionResult::Continue
         }
       } else {
@@ -403,7 +445,8 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn get_backend_address(&self) -> Option<SocketAddr> {
-    self.backend_address.or_else( || self.backend.as_ref().and_then(|backend| backend.peer_addr().ok()))
+    self.backend_data.as_ref().map(|b| b.borrow().address)
+        .or_else( || self.backend.as_ref().and_then(|backend| backend.peer_addr().ok()))
   }
 
   pub fn websocket_context(&self) -> String {
@@ -443,11 +486,13 @@ impl<Front:SocketHandler> Http<Front> {
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
-    let wait_time  = metrics.wait_time;
+    let _wait_time  = metrics.wait_time;
 
     let app_id = OptionalString::new(self.app_id.as_ref().map(|s| s.as_str()));
-    time!("request_time", app_id.as_str(), response_time.whole_milliseconds());
+    time!("response_time", app_id.as_str(), response_time.whole_milliseconds());
     time!("service_time", app_id.as_str(), service_time.whole_milliseconds());
+    time!("response_time", response_time.whole_milliseconds());
+    time!("service_time", service_time.whole_milliseconds());
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
@@ -488,8 +533,11 @@ impl<Front:SocketHandler> Http<Front> {
     let service_time  = metrics.service_time();
 
     if let Some(ref app_id) = self.app_id {
-      time!("http.request.time", &app_id, response_time.whole_milliseconds());
+      time!("response_time", &app_id, response_time.whole_milliseconds());
+      time!("service_time", &app_id, service_time.whole_milliseconds());
     }
+    time!("response_time", response_time.whole_milliseconds());
+    time!("service_time", service_time.whole_milliseconds());
     incr!("http.errors");
 
     let proto = self.protocol_string();
@@ -516,6 +564,12 @@ impl<Front:SocketHandler> Http<Front> {
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
+    if let Some(ref app_id) = self.app_id {
+      time!("response_time", &app_id, response_time.whole_milliseconds());
+      time!("service_time", &app_id, service_time.whole_milliseconds());
+    }
+    time!("response_time", response_time.whole_milliseconds());
+    time!("service_time", service_time.whole_milliseconds());
     incr!("http.errors");
     /*
     let app_id = self.app_id.clone().unwrap_or(String::from("-"));
@@ -537,6 +591,10 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Read content from the session
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    if !self.front_timeout.reset() {
+        //error!("could not reset front timeout");
+    }
+
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       self.front_readiness.interest.insert(Ready::writable());
       self.back_readiness.interest.remove(Ready::readable());
@@ -559,8 +617,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     if self.front_buf.as_ref().unwrap().buffer.available_space() == 0 {
       if self.backend_token == None {
-        let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
-        self.set_answer(DefaultAnswerStatus::Answer413, Rc::new(Vec::from(answer_413.as_bytes())));
+        self.set_answer(DefaultAnswerStatus::Answer413, None);
         self.front_readiness.interest.remove(Ready::readable());
         self.front_readiness.interest.insert(Ready::writable());
       } else {
@@ -669,8 +726,7 @@ impl<Front:SocketHandler> Http<Front> {
       if unwrap_msg!(self.request.as_ref()).is_front_error() {
         incr!("http.front_parse_errors");
 
-        let answer_400 = &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..];
-        self.set_answer(DefaultAnswerStatus::Answer400, Rc::new(Vec::from(answer_400)));
+        self.set_answer(DefaultAnswerStatus::Answer400, None);
         gauge_add!("http.active_requests", 1);
 
         return SessionResult::Continue;
@@ -698,6 +754,12 @@ impl<Front:SocketHandler> Http<Front> {
           // stop reading
           self.front_readiness.interest.remove(Ready::readable());
         }
+
+        // if it was the first request, the front timeout duration
+        // was set to request_timeout, which is much lower. For future
+        // requests on this connection, we can wait a bit more
+        self.front_timeout.set_duration(self.frontend_timeout_duration);
+
         SessionResult::Continue
       },
       Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
@@ -710,6 +772,11 @@ impl<Front:SocketHandler> Http<Front> {
         SessionResult::CloseSession
       },
       Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
+        // if it was the first request, the front timeout duration
+        // was set to request_timeout, which is much lower. For future
+        // requests on this connection, we can wait a bit more
+        self.front_timeout.set_duration(self.frontend_timeout_duration);
+
         if ! self.front_buf.as_ref().unwrap().needs_input() {
           let (request_state, header_end) = (self.request.take().unwrap(), self.req_header_end.take());
           let (request_state, header_end) = parse_request_until_stop(request_state,
@@ -743,8 +810,7 @@ impl<Front:SocketHandler> Http<Front> {
         self.req_header_end = header_end;
 
         if unwrap_msg!(self.request.as_ref()).is_front_error() {
-          let answer_400 = &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..];
-          self.set_answer(DefaultAnswerStatus::Answer400, Rc::new(Vec::from(answer_400)));
+          self.set_answer(DefaultAnswerStatus::Answer400, None);
           return SessionResult::Continue;
         }
 
@@ -801,7 +867,6 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Forward content to session
   pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-
     //handle default answers
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       return self.writable_default_answer(metrics);
@@ -832,7 +897,7 @@ impl<Front:SocketHandler> Http<Front> {
       }
       //let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.as_ref().unwrap().next_output_data());
       let (current_sz, current_res) = if self.frontend.has_vectored_writes() {
-        let bufs = self.back_buf.as_ref().unwrap().as_iovec();
+        let bufs = self.back_buf.as_ref().unwrap().as_ioslice();
         if bufs.is_empty() {
           break;
         }
@@ -927,8 +992,8 @@ impl<Front:SocketHandler> Http<Front> {
         if front_keep_alive && back_keep_alive {
           debug!("{} keep alive front/back", self.log_context());
           self.reset();
-          self.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-          self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
+          self.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
+          self.back_readiness.interest  = Ready::hup() | Ready::error();
 
           SessionResult::Continue
           //FIXME: issues reusing the backend socket
@@ -937,8 +1002,8 @@ impl<Front:SocketHandler> Http<Front> {
         } else if front_keep_alive && !back_keep_alive {
           debug!("{} keep alive front", self.log_context());
           self.reset();
-          self.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-          self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
+          self.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
+          self.back_readiness.interest  = Ready::hup() | Ready::error();
           SessionResult::CloseBackend(self.backend_token.take())
         } else {
           debug!("{} no keep alive", self.log_context());
@@ -1016,7 +1081,7 @@ impl<Front:SocketHandler> Http<Front> {
         /*
         let (current_sz, current_res) = sock.socket_write(self.front_buf.as_ref().unwrap().next_output_data());
         */
-        let bufs = self.front_buf.as_ref().unwrap().as_iovec();
+        let bufs = self.front_buf.as_ref().unwrap().as_ioslice();
         if bufs.is_empty() {
           break;
         }
@@ -1072,6 +1137,12 @@ impl<Front:SocketHandler> Http<Front> {
           self.front_readiness.interest.remove(Ready::readable());
           self.back_readiness.interest.insert(Ready::readable());
           self.back_readiness.interest.remove(Ready::writable());
+
+          // cancel the front timeout while we are waiting for the server to answer
+          self.front_timeout.cancel();
+          if let Some(token) = self.backend_token.as_ref() {
+              self.back_timeout.set(*token);
+          }
           SessionResult::Continue
         },
         Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Initial)) => {
@@ -1113,6 +1184,10 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Read content from application
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, SessionResult) {
+    if !self.back_timeout.reset() {
+        error!("could not reset back timeout {:?}:\n{}", self.back_timeout, self.print_state(""));
+    }
+
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       error!("{}\tsending default answer, should not read from back socket", self.log_context());
       self.back_readiness.interest.remove(Ready::readable());
@@ -1171,6 +1246,8 @@ impl<Front:SocketHandler> Http<Front> {
     if let Some(ResponseState::ResponseUpgrade(_,_, ref protocol)) = self.response {
       debug!("got an upgrade state[{}]: {:?}", line!(), protocol);
       if compare_no_case(protocol.as_bytes(), "websocket".as_bytes()) {
+        self.front_timeout.reset();
+        self.back_timeout.reset();
         return (ProtocolResult::Upgrade, SessionResult::Continue);
       } else {
         //FIXME: should we upgrade to a pipe or send an error?
@@ -1300,8 +1377,7 @@ impl<Front:SocketHandler> Http<Front> {
         };
 
         if unwrap_msg!(self.response.as_ref()).is_back_error() {
-          let answer_502 = "HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-          self.set_answer(DefaultAnswerStatus::Answer502, Rc::new(Vec::from(answer_502.as_bytes())));
+          self.set_answer(DefaultAnswerStatus::Answer502, None);
           return (ProtocolResult::Continue, self.writable(metrics));
         }
 
@@ -1314,6 +1390,8 @@ impl<Front:SocketHandler> Http<Front> {
         if let Some(ResponseState::ResponseUpgrade(_,_, ref protocol)) = self.response {
           debug!("got an upgrade state[{}]: {:?}", line!(), protocol);
           if compare_no_case(protocol.as_bytes(), "websocket".as_bytes()) {
+            self.front_timeout.reset();
+            self.back_timeout.reset();
             return (ProtocolResult::Upgrade, SessionResult::Continue);
           } else {
             //FIXME: should we upgrade to a pipe or send an error?
@@ -1338,6 +1416,59 @@ impl<Front:SocketHandler> Http<Front> {
       .and_then(|conn| conn.sticky_session.as_ref())
       .map(|sticky_client| sticky_client != &session.sticky_id)
       .unwrap_or(true)
+  }
+
+  pub fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> SessionResult {
+    //info!("got timeout for token: {:?}", token);
+    if self.frontend_token == token {
+      self.front_timeout.triggered();
+      match self.timeout_status() {
+        TimeoutStatus::Request => {
+          self.set_answer(DefaultAnswerStatus::Answer408, None);
+          self.writable(metrics)
+        },
+        TimeoutStatus::WaitingForResponse => {
+          self.set_answer(DefaultAnswerStatus::Answer504, None);
+          self.writable(metrics)
+        },
+        TimeoutStatus::Response => {
+          SessionResult::CloseSession
+        },
+        TimeoutStatus::WaitingForNewRequest => SessionResult::CloseSession,
+      }
+    } else if self.backend_token == Some(token) {
+        //info!("backend timeout triggered for token {:?}", token);
+        self.back_timeout.triggered();
+        match self.timeout_status() {
+            TimeoutStatus::Request => {
+                error!("got backend timeout while waiting for a request, this should not happen");
+                self.set_answer(DefaultAnswerStatus::Answer504, None);
+                self.writable(metrics)
+            },
+            TimeoutStatus::WaitingForResponse => {
+                self.set_answer(DefaultAnswerStatus::Answer504, None);
+                self.writable(metrics)
+            },
+            TimeoutStatus::Response => {
+                error!("backend {:?} timeout while receiving response (application {:?})",
+                  self.backend_id, self.app_id);
+                SessionResult::CloseSession
+            },
+            TimeoutStatus::WaitingForNewRequest => SessionResult::Continue,
+        }
+    } else {
+        error!("got timeout for an invalid token");
+        SessionResult::CloseSession
+    }
+  }
+
+  pub fn cancel_timeouts(&mut self) {
+      self.front_timeout.cancel();
+      self.back_timeout.cancel();
+  }
+
+  pub fn cancel_backend_timeout(&mut self) {
+      self.back_timeout.cancel();
   }
 }
 
@@ -1477,11 +1608,15 @@ impl AddedRequestHeader {
         let mut s = String::new();
 
         if !headers.x_proto {
-            write!(&mut s, "X-Forwarded-Proto: {}\r\n", proto);
+            if let Err(e) = write!(&mut s, "X-Forwarded-Proto: {}\r\n", proto) {
+                error!("could not append request header: {:?}", e);
+            }
         }
 
         if !headers.x_port {
-            write!(&mut s, "X-Forwarded-Port: {}\r\n", front_port);
+            if let Err(e) = write!(&mut s, "X-Forwarded-Port: {}\r\n", front_port) {
+                error!("could not append request header: {:?}", e);
+            }
         }
 
         if let Some(peer_addr) = self.peer_address {
@@ -1489,43 +1624,61 @@ impl AddedRequestHeader {
             let peer_port = peer_addr.port();
             match &headers.x_for {
                 None => {
-                    write!(&mut s, "X-Forwarded-For: {}\r\n", peer_ip);
+                    if let Err(e) = write!(&mut s, "X-Forwarded-For: {}\r\n", peer_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
                 Some(value) => {
-                    write!(&mut s, "X-Forwarded-For: {}, {}\r\n", value, peer_ip);
+                    if let Err(e) = write!(&mut s, "X-Forwarded-For: {}, {}\r\n", value, peer_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
             }
 
             match &headers.forwarded {
                 None => {
-                    write!(&mut s, "Forwarded: ");
+                    if let Err(e) = write!(&mut s, "Forwarded: ") {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
                 Some(value) => {
-                    write!(&mut s, "Forwarded: {}, ", value);
+                    if let Err(e) = write!(&mut s, "Forwarded: {}, ", value) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
             }
 
             match (peer_ip, peer_port, front_ip) {
                 (IpAddr::V4(_), peer_port, IpAddr::V4(_)) => {
-                    write!(&mut s, "proto={};for={}:{};by={}\r\n",
-                           proto, peer_ip, peer_port, front_ip)
+                    if let Err(e) = write!(&mut s, "proto={};for={}:{};by={}\r\n",
+                           proto, peer_ip, peer_port, front_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
                 (IpAddr::V4(_), peer_port, IpAddr::V6(_)) => {
-                    write!(&mut s, "proto={};for={}:{};by=\"{}\"\r\n",
-                           proto, peer_ip, peer_port, front_ip)
+                    if let Err(e) = write!(&mut s, "proto={};for={}:{};by=\"{}\"\r\n",
+                           proto, peer_ip, peer_port, front_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
                 (IpAddr::V6(_), peer_port, IpAddr::V4(_)) => {
-                    write!(&mut s, "proto={};for=\"{}:{}\";by={}\r\n",
-                           proto, peer_ip, peer_port, front_ip)
+                    if let Err(e) = write!(&mut s, "proto={};for=\"{}:{}\";by={}\r\n",
+                           proto, peer_ip, peer_port, front_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
                 (IpAddr::V6(_), peer_port, IpAddr::V6(_)) => {
-                    write!(&mut s, "proto={};for=\"{}:{}\";by=\"{}\"\r\n",
-                           proto, peer_ip, peer_port, front_ip)
+                    if let Err(e) = write!(&mut s, "proto={};for=\"{}:{}\";by=\"{}\"\r\n",
+                           proto, peer_ip, peer_port, front_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
             };
         }
 
-        write!(&mut s, "Sozu-Id: {}\r\n{}", self.request_id, closing_header);
+        if let Err(e) = write!(&mut s, "Sozu-Id: {}\r\n{}", self.request_id, closing_header) {
+            error!("could not append request header: {:?}", e);
+        }
 
         s
     }

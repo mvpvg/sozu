@@ -167,20 +167,17 @@ extern crate rusty_ulid;
 extern crate net2;
 extern crate libc;
 extern crate slab;
-extern crate mio_uds;
 extern crate hdrhistogram;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
 extern crate idna;
 extern crate webpki;
-extern crate mio_extras;
 extern crate poule;
-
+extern crate lazycell;
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
 #[cfg(feature = "use-openssl")]
 extern crate openssl_sys;
-extern crate iovec;
 extern crate foreign_types_shared;
 
 #[macro_use] pub mod util;
@@ -196,6 +193,7 @@ pub mod backends;
 pub mod retry;
 pub mod load_balancing;
 pub mod features;
+pub mod timer;
 
 #[cfg(feature = "splice")]
 mod splice;
@@ -208,8 +206,7 @@ pub mod https_openssl;
 
 pub mod https_rustls;
 
-use mio::{Poll,Ready,Token};
-use mio::unix::UnixReady;
+use mio::{Poll, Token};
 use mio::net::TcpStream;
 use std::fmt;
 use std::str;
@@ -217,9 +214,9 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::cell::RefCell;
 use time::{Instant,Duration};
-use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams,ProxyEvent};
+use sozu_command::ready::Ready;
 
 use self::retry::RetryPolicy;
 
@@ -249,8 +246,7 @@ pub trait ProxySession {
   fn process_events(&mut self, token: Token, events: Ready);
   fn close(&mut self, poll: &mut Poll) -> CloseResult;
   fn close_backend(&mut self, token: Token, poll: &mut Poll);
-  fn timeout(&mut self, t: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult;
-  fn cancel_timeouts(&self, timer: &mut Timer<Token>);
+  fn timeout(&mut self, t: Token) -> SessionResult;
   fn last_event(&self) -> Instant;
   fn print_state(&self);
   fn tokens(&self) -> Vec<Token>;
@@ -260,8 +256,17 @@ pub trait ProxySession {
 #[derive(Clone,Copy,Debug,PartialEq)]
 pub enum BackendConnectionStatus {
   NotConnected,
-  Connecting,
+  Connecting(Instant),
   Connected,
+}
+
+impl BackendConnectionStatus {
+    pub fn is_connecting(&self) -> bool {
+        match self {
+            BackendConnectionStatus::Connecting(_) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug,PartialEq)]
@@ -284,7 +289,8 @@ pub trait ProxyConfiguration<Session> {
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse;
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
-  fn create_session(&mut self, socket: TcpStream, token: ListenToken, event_loop: &mut Poll, session_token: Token, timeout: Timeout, delay: Duration)
+  fn create_session(&mut self, socket: TcpStream, token: ListenToken,
+                    event_loop: &mut Poll, session_token: Token, wait_time: Duration)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
   fn listen_port_state(&self, port: &u16) -> ListenPortState;
 }
@@ -401,7 +407,7 @@ pub enum BackendStatus {
   Closed,
 }
 
-#[derive(Debug,PartialEq,Eq,Clone)]
+#[derive(Debug,PartialEq,Clone)]
 pub struct Backend {
   pub sticky_id:                 Option<String>,
   pub backend_id:                String,
@@ -409,9 +415,11 @@ pub struct Backend {
   pub status:                    BackendStatus,
   pub retry_policy:              retry::RetryPolicyWrapper,
   pub active_connections:        usize,
+  pub active_requests:           usize,
   pub failures:                  usize,
   pub load_balancing_parameters: Option<LoadBalancingParams>,
   pub backup:                    bool,
+  pub connection_time: PeakEWMA,
 }
 
 impl Backend {
@@ -424,9 +432,11 @@ impl Backend {
       status:             BackendStatus::Normal,
       retry_policy:       desired_policy.into(),
       active_connections: 0,
+      active_requests:    0,
       failures:           0,
       load_balancing_parameters,
       backup: backup.unwrap_or(false),
+      connection_time: PeakEWMA::new(),
     }
   }
 
@@ -478,13 +488,21 @@ impl Backend {
     }
   }
 
-  pub fn try_connect(&mut self) -> Result<mio::tcp::TcpStream, ConnectionError> {
+  pub fn set_connection_time(&mut self, dur: Duration) {
+      self.connection_time.observe(dur.whole_nanoseconds() as f64);
+  }
+
+  pub fn peak_ewma_connection(&mut self) -> f64 {
+      self.connection_time.get(self.active_connections)
+  }
+
+  pub fn try_connect(&mut self) -> Result<mio::net::TcpStream, ConnectionError> {
     if self.status != BackendStatus::Normal {
       return Err(ConnectionError::NoBackendAvailable);
     }
 
     //FIXME: what happens if the connect() call fails with EINPROGRESS?
-    let conn = mio::tcp::TcpStream::connect(&self.address).map_err(|_| ConnectionError::NoBackendAvailable);
+    let conn = mio::net::TcpStream::connect(self.address).map_err(|_| ConnectionError::NoBackendAvailable);
     if conn.is_ok() {
       //self.retry_policy.succeed();
       self.inc_connections();
@@ -508,25 +526,25 @@ impl std::ops::Drop for Backend {
 
 #[derive(Clone)]
 pub struct Readiness {
-  pub event:    UnixReady,
-  pub interest: UnixReady,
+  pub event:    Ready,
+  pub interest: Ready,
 }
 
 impl Readiness {
   pub fn new() -> Readiness {
     Readiness {
-      event:    UnixReady::from(Ready::empty()),
-      interest: UnixReady::from(Ready::empty()),
+      event:    Ready::empty(),
+      interest: Ready::empty(),
     }
   }
 
   pub fn reset(&mut self) {
-    self.event =  UnixReady::from(Ready::empty());
-    self.interest  = UnixReady::from(Ready::empty());
+    self.event = Ready::empty();
+    self.interest = Ready::empty();
   }
 }
 
-pub fn display_unix_ready(s: &mut [u8], readiness: UnixReady) {
+pub fn display_ready(s: &mut [u8], readiness: Ready) {
   if readiness.is_readable() {
     s[0] = b'R';
   }
@@ -541,9 +559,9 @@ pub fn display_unix_ready(s: &mut [u8], readiness: UnixReady) {
   }
 }
 
-pub fn unix_ready_to_string(readiness: UnixReady) -> String {
+pub fn ready_to_string(readiness: Ready) -> String {
   let s = &mut [b'-'; 4];
-  display_unix_ready(s, readiness);
+  display_ready(s, readiness);
   String::from_utf8(s.to_vec()).unwrap()
 }
 
@@ -554,9 +572,9 @@ impl fmt::Debug for Readiness {
     let r = &mut [b'-'; 4];
     let mixed = &mut [b'-'; 4];
 
-    display_unix_ready(i, self.interest);
-    display_unix_ready(r, self.event);
-    display_unix_ready(mixed, self.interest & self.event);
+    display_ready(i, self.interest);
+    display_ready(r, self.event);
+    display_ready(mixed, self.interest & self.event);
 
     write!(f, "Readiness {{ interest: {}, readiness: {}, mixed: {} }}",
       str::from_utf8(i).unwrap(),
@@ -591,11 +609,11 @@ pub struct SessionMetrics {
 }
 
 impl SessionMetrics {
-  pub fn new(delay: Option<Duration>) -> SessionMetrics {
+  pub fn new(wait_time: Option<Duration>) -> SessionMetrics {
     SessionMetrics {
       start:         Some(Instant::now()),
       service_time:  Duration::seconds(0),
-      wait_time:     delay.unwrap_or_else(|| Duration::seconds(0)),
+      wait_time:     wait_time.unwrap_or_else(|| Duration::seconds(0)),
       bin:           0,
       bout:          0,
       service_start: None,
@@ -631,7 +649,6 @@ impl SessionMetrics {
     }
 
     self.service_start = Some(now);
-    let prev = self.wait_time;
     self.wait_time = self.wait_time + (now - self.wait_start);
   }
 
@@ -721,3 +738,58 @@ impl fmt::Display for LogDuration {
   }
 }
 
+/// exponentially weighted moving average with high sensibility to latency bursts
+///
+/// cf Finagle for the original implementation: https://github.com/twitter/finagle/blob/9cc08d15216497bb03a1cafda96b7266cfbbcff1/finagle-core/src/main/scala/com/twitter/finagle/loadbalancer/PeakEwma.scala
+#[derive(Debug,PartialEq,Clone)]
+pub struct PeakEWMA {
+    /// decay in nanoseconds
+    ///
+    /// higher values will make the EWMA decay slowly to 0
+    pub decay: f64,
+    /// estimated RTT in nanoseconds
+    ///
+    /// must be set to a high enough default value so that new backends do not
+    /// get all the traffic right away
+    pub rtt: f64,
+    /// last modification
+    pub last_event: Instant,
+}
+
+impl PeakEWMA {
+    // hardcoded default values for now
+    pub fn new() -> Self {
+        PeakEWMA {
+            // 1s
+            decay: 1_000_000_000f64,
+            // 50ms
+            rtt: 50_000_000f64,
+            last_event: Instant::now(),
+        }
+    }
+
+    pub fn observe(&mut self, rtt: f64) {
+        let now = Instant::now();
+        let dur = now - self.last_event;
+
+        // if latency is rising, we will immediately raise the cost
+        if rtt > self.rtt {
+            self.rtt = rtt;
+        } else {
+            // new_rtt = old_rtt * e^(-elapsed/decay) + observed_rtt * (1 - e^(-elapsed/decay))
+            let weight = (-1.0 * dur.whole_nanoseconds() as f64 / self.decay).exp();
+            self.rtt = self.rtt * weight + rtt * (1.0 - weight);
+        }
+
+        self.last_event = now;
+    }
+
+    pub fn get(&mut self, active_requests: usize) -> f64 {
+        let before = self.rtt;
+        // decay the current value
+        // (we might not have seen a request in a long time)
+        self.observe(0.0);
+
+        (active_requests + 1) as f64 * self.rtt
+    }
+}

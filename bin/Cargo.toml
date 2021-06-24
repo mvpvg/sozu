@@ -9,6 +9,7 @@ version = "0.12.0"
 license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
+edition="2018"
 
 include = [
   "README.md",
@@ -20,8 +21,7 @@ include = [
 name = "sozu"
 
 [dependencies]
-mio = "^0.6"
-mio-uds = "^0.6"
+mio = { version = "^0.7", features = [ "os-poll", "uds" ] }
 serde = "~1.0.2"
 serde_json = "~1.0.1"
 serde_derive = "~1.0.2"
@@ -29,14 +29,21 @@ nom = "^6.0"
 nix  = "^0.15"
 time = "^0.2"
 clap = "^2.19.0"
-slab = "^0.3.0"
+slab = "^0.4.0"
 libc = "^0.2"
 rand = "^0.8"
 tempfile = "^3.0"
-futures = "^0.1"
+futures = "^0.3"
 lazy_static = "^1.1"
 regex = "1.0"
 jemallocator = {version = "^0.3", optional = true }
+smol = "0.2"
+blocking = "0.4"
+async-io = "0.1"
+async-dup = "1.2"
+futures-lite = "0.1"
+log = "^0.4"
+
 sozu-lib = { version = "^0.12.0", path = "../lib" }
 sozu-command-lib = { version = "^0.12.0", path = "../command" }
 

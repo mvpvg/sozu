@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::collections::{HashMap,BTreeMap,HashSet};
 use std::str::FromStr;
 
-use config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
+use crate::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 
 pub type MessageId = String;
 
@@ -225,23 +225,25 @@ impl<'de> serde::Deserialize<'de> for CertFingerprint {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Application {
-    pub app_id:            String,
+    pub app_id: String,
     #[serde(default)]
     #[serde(skip_serializing_if="is_false")]
-    pub sticky_session:    bool,
+    pub sticky_session: bool,
     #[serde(default)]
     #[serde(skip_serializing_if="is_false")]
-    pub https_redirect:    bool,
+    pub https_redirect: bool,
     #[serde(default)]
     #[serde(skip_serializing_if="is_default")]
-    pub proxy_protocol:    Option<ProxyProtocolConfig>,
-    #[serde(rename = "load_balancing_policy")]
+    pub proxy_protocol: Option<ProxyProtocolConfig>,
+    #[serde(rename = "load_balancing")]
     #[serde(default)]
     #[serde(skip_serializing_if="is_default")]
-    pub load_balancing_policy: LoadBalancingAlgorithms,
+    pub load_balancing: LoadBalancingAlgorithms,
     #[serde(default)]
     #[serde(skip_serializing_if="is_default")]
-    pub answer_503:        Option<String>,
+    pub answer_503: Option<String>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub load_metric: Option<LoadMetric>,
 }
 
 fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
@@ -387,6 +389,18 @@ impl Default for LoadBalancingParams {
   }
 }
 
+/// how sozu measures which backend is less loaded
+#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadMetric {
+    /// number of TCP connections
+    Connections,
+    /// number of active HTTP requests
+    Requests,
+    /// time to connect to the backend, weighted by the number of active connections (peak EWMA)
+    ConnectionTime,
+}
+
 pub fn default_sticky_name() -> String {
   String::from("SOZUBALANCEID")
 }
@@ -430,6 +444,14 @@ pub struct HttpListener {
     pub expect_proxy:   bool,
     #[serde(default = "default_sticky_name")]
     pub sticky_name:    String,
+    /// client inactive time
+    pub front_timeout:  u32,
+    /// backend server inactive time
+    pub back_timeout:   u32,
+    /// time to connect to the backend
+    pub connect_timeout: u32,
+    /// max time to send a complete request
+    pub request_timeout: u32,
 }
 
 impl Default for HttpListener {
@@ -441,6 +463,10 @@ impl Default for HttpListener {
       answer_503:      String::from("HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       expect_proxy:    false,
       sticky_name:     String::from("SOZUBALANCEID"),
+      front_timeout:   60,
+      back_timeout:    30,
+      connect_timeout: 3,
+      request_timeout: 10,
     }
   }
 }
@@ -500,7 +526,7 @@ impl error::Error for ParseErrorTlsVersion {
     "Cannot find the TLS version"
   }
 
-  fn cause(&self) -> Option<&error::Error> {
+  fn cause(&self) -> Option<&dyn error::Error> {
     None
   }
 }
@@ -526,6 +552,11 @@ pub struct HttpsListener {
     pub certificate_chain:  Vec<String>,
     #[serde(default)]
     pub key:                Option<String>,
+    pub front_timeout:  u32,
+    pub back_timeout:   u32,
+    pub connect_timeout: u32,
+    /// max time to send a complete request
+    pub request_timeout: u32,
 }
 
 impl Default for HttpsListener {
@@ -557,6 +588,10 @@ impl Default for HttpsListener {
       certificate:         None,
       certificate_chain:   vec![],
       key:                 None,
+      front_timeout:   60,
+      back_timeout:    30,
+      connect_timeout: 3,
+      request_timeout: 10,
     }
   }
 }
@@ -570,6 +605,9 @@ pub struct TcpListener {
   #[serde(default)]
   #[serde(skip_serializing_if = "is_false")]
   pub expect_proxy:   bool,
+  pub front_timeout:  u32,
+  pub back_timeout:   u32,
+  pub connect_timeout: u32,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -681,9 +719,10 @@ pub enum Topic {
     TcpProxyConfig
 }
 
+/*
 fn is_true(b: &bool) -> bool {
     *b
-}
+}*/
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -735,7 +774,7 @@ mod tests {
       backend_id: String::from("xxx-0"),
       address: "0.0.0.0:8080".parse().unwrap(),
       sticky_id: None,
-      load_balancing_parameters: Some(LoadBalancingParams{ weight: 0 }),
+      load_balancing_parameters: Some(LoadBalancingParams{ weight: 0, ..Default::default() }),
       backup: None,
     }));
   }

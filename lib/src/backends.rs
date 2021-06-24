@@ -119,11 +119,11 @@ impl BackendMap {
     }
   }
 
-  pub fn set_load_balancing_policy_for_app(&mut self, app_id: &str, lb_algo: LoadBalancingAlgorithms) {
+  pub fn set_load_balancing_policy_for_app(&mut self, app_id: &str, lb_algo: LoadBalancingAlgorithms, metric: Option<proxy::LoadMetric>) {
     // The application can be created before the backends were registered because of the async config messages.
     // So when we set the load balancing policy, we have to create the backend list if if it doesn't exist yet.
     let app_backends = self.get_or_create_backend_list_for_app(app_id);
-    app_backends.set_load_balancing_policy(lb_algo);
+    app_backends.set_load_balancing_policy(lb_algo, metric);
   }
 
   pub fn get_or_create_backend_list_for_app(&mut self, app_id: &str) -> &mut BackendList {
@@ -143,7 +143,7 @@ impl BackendList {
     BackendList {
       backends:       Vec::new(),
       next_id:        0,
-      load_balancing: Box::new(RandomAlgorithm{}),
+      load_balancing: Box::new(Random),
     }
   }
 
@@ -219,15 +219,16 @@ impl BackendList {
     if backends.is_empty() {
       None
     } else {
-      self.load_balancing.next_available_backend(&backends)
+      self.load_balancing.next_available_backend(&mut backends)
     }
   }
 
-  pub fn set_load_balancing_policy(&mut self, load_balancing_policy: LoadBalancingAlgorithms) {
+  pub fn set_load_balancing_policy(&mut self, load_balancing_policy: LoadBalancingAlgorithms, metric: Option<proxy::LoadMetric>) {
     match load_balancing_policy {
-      LoadBalancingAlgorithms::RoundRobin => self.load_balancing = Box::new(RoundRobinAlgorithm{ next_backend: 0 }),
-      LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(RandomAlgorithm{}),
-      LoadBalancingAlgorithms::LeastConnections => self.load_balancing = Box::new(LeastConnectionsAlgorithm{}),
+      LoadBalancingAlgorithms::RoundRobin => self.load_balancing = Box::new(RoundRobin::new()),
+      LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(Random{}),
+      LoadBalancingAlgorithms::LeastLoaded => self.load_balancing = Box::new(LeastLoaded{ metric: metric.clone().unwrap_or(proxy::LoadMetric::Connections) }),
+      LoadBalancingAlgorithms::PowerOfTwo => self.load_balancing = Box::new(PowerOfTwo{ metric: metric.clone().unwrap_or(proxy::LoadMetric::Connections) }),
     }
   }
 }

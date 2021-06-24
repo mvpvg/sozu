@@ -1,5 +1,4 @@
-use mio_uds::UnixStream;
-use mio::Ready;
+use mio::net::UnixStream;
 use libc::{self,pid_t};
 use std::io::{Seek,SeekFrom};
 use std::fs::File;
@@ -14,7 +13,7 @@ use nix::unistd::*;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 #[cfg(target_os = "macos")]
-use libc::{PATH_MAX, c_char,uint32_t,int32_t};
+use libc::{PATH_MAX, c_char};
 #[cfg(target_os = "macos")]
 use std::iter::repeat;
 #[cfg(target_os = "macos")]
@@ -34,12 +33,13 @@ use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyRequestData};
+use sozu_command::ready::Ready;
 use sozu::server::Server;
 use sozu::metrics;
 
-use util;
-use logging;
-use command::Worker;
+use crate::util;
+use crate::logging;
+use crate::command::Worker;
 
 pub fn start_workers(executable_path: String, config: &Config) -> nix::Result<Vec<Worker>> {
   let state = ConfigState::new();
@@ -54,9 +54,11 @@ pub fn start_workers(executable_path: String, config: &Config) -> nix::Result<Ve
       Ok((pid, command, scm)) => {
         let mut w =  Worker::new(index as u32, pid, command, scm, config);
         // the new worker expects a status message at startup
-        w.channel.set_blocking(true);
-        w.channel.write_message(&ProxyRequest { id: format!("start-status-{}", index), order: ProxyRequestData::Status });
-        w.channel.set_nonblocking(true);
+        if let Some(channel) = w.channel.as_mut() {
+            channel.set_blocking(true);
+            channel.write_message(&ProxyRequest { id: format!("start-status-{}", index), order: ProxyRequestData::Status });
+            channel.set_nonblocking(true);
+        }
         workers.push(w);
       },
       Err(e) => return Err(e)
@@ -204,7 +206,7 @@ pub unsafe fn get_executable_path() -> String {
 
 #[cfg(target_os = "macos")]
 extern {
-  pub fn _NSGetExecutablePath(buf: *mut c_char, size: *mut uint32_t) -> int32_t;
+  pub fn _NSGetExecutablePath(buf: *mut c_char, size: *mut u32) -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -215,7 +217,7 @@ pub unsafe fn get_executable_path() -> String {
   let pathbuf = CString::from_vec_unchecked(temp);
   let ptr = pathbuf.into_raw();
 
-  let mut size:uint32_t = capacity as u32;
+  let mut size = capacity as u32;
   if _NSGetExecutablePath(ptr, &mut size) == 0 {
 
     let mut temp2:Vec<u8> = Vec::with_capacity(capacity);

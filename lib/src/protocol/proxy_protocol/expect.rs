@@ -1,9 +1,8 @@
 use std::io::Read;
 
 use mio::*;
-use mio::tcp::TcpStream;
-use mio::unix::UnixReady;
-use nom::Err;
+use mio::net::TcpStream;
+use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
 use SessionResult;
 use Readiness;
@@ -12,10 +11,10 @@ use socket::{SocketHandler, SocketResult};
 use SessionMetrics;
 use protocol::pipe::Pipe;
 use pool::Checkout;
-use sozu_command::buffer::fixed::Buffer;
 use super::parser::parse_v2_header;
 use super::header::ProxyAddr;
 use Protocol;
+use sozu_command::ready::Ready;
 
 #[derive(Clone,Copy)]
 pub enum HeaderLen {
@@ -45,8 +44,8 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       index: 0,
       header_len: HeaderLen::V4,
       readiness: Readiness {
-        interest:  UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
-        event: UnixReady::from(Ready::empty()),
+        interest: Ready::readable(),
+        event: Ready::empty(),
       },
       addresses: None,
     }
@@ -112,8 +111,8 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
         };
         (ProtocolResult::Continue, SessionResult::Continue)
       },
-      Err(e) => {
-        error!("[{:?}] front socket parse error, closing the connection: {:?}", self.frontend_token, e);
+      Err(Err::Error(e)) | Err(Err::Failure(e)) => {
+        error!("[{:?}] expect proxy protocol front socket parse error, closing the connection:\n{}", self.frontend_token, e.input.to_hex(16));
         metrics.service_stop();
         incr!("proxy_protocol.errors");
         self.readiness.reset();
@@ -124,6 +123,10 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
 
   pub fn front_socket(&self) -> &TcpStream {
     self.frontend.socket_ref()
+  }
+
+  pub fn front_socket_mut(&mut self) -> &mut TcpStream {
+    self.frontend.socket_mut()
   }
 
   pub fn readiness(&mut self) -> &mut Readiness {
@@ -190,7 +193,7 @@ mod expect_test {
 
   // Accept connection from an upfront proxy and expect to read a proxy protocol header in this stream.
   fn start_middleware(middleware_addr: SocketAddr, barrier: Arc<Barrier>) {
-    let upfront_middleware_conn_listener = TcpListener::bind(&middleware_addr).expect("could not accept upfront middleware connection");
+    let upfront_middleware_conn_listener = TcpListener::bind(middleware_addr).expect("could not accept upfront middleware connection");
     let session_stream;
     barrier.wait();
 

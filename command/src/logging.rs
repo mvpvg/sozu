@@ -7,14 +7,14 @@ use std::fmt::{Arguments,format};
 use std::io::{stdout,Stdout,Write};
 use std::net::{SocketAddr,UdpSocket};
 use std::net::TcpStream;
-use mio_uds::UnixDatagram;
+use mio::net::UnixDatagram;
 
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
   pub static TAG:    String          = LOGGER.with(|logger| (*logger.borrow()).tag.clone());
 }
 
-static COMPAT_LOGGER: CompatLogger = CompatLogger;
+pub static COMPAT_LOGGER: CompatLogger = CompatLogger;
 
 pub struct Logger {
   pub directives:     Vec<LogDirective>,
@@ -193,7 +193,7 @@ pub enum LoggerBackend {
   Unix(UnixDatagram),
   Udp(UdpSocket, SocketAddr),
   Tcp(TcpStream),
-  File(::writer::MultiLineWriter<File>),
+  File(crate::writer::MultiLineWriter<File>),
 }
 
 #[repr(usize)]
@@ -619,8 +619,8 @@ macro_rules! fixme {
     };
 }
 
-use log;
-struct CompatLogger;
+use crate::log;
+pub struct CompatLogger;
 
 impl From<log::Level> for LogLevel {
   fn from(lvl: log::Level) -> Self {
@@ -667,7 +667,7 @@ macro_rules! setup_test_logger {
 }
 
 pub struct Rfc3339Time {
-  inner: ::time::PrimitiveDateTime,
+  inner: ::time::OffsetDateTime,
 }
 
 impl std::fmt::Display for Rfc3339Time {
@@ -682,6 +682,6 @@ impl std::fmt::Display for Rfc3339Time {
 }
 
 pub fn now() -> (Rfc3339Time, i128) {
-  let t = time::PrimitiveDateTime::now();
-  (Rfc3339Time { inner: t, }, (t - time::PrimitiveDateTime::unix_epoch()).whole_nanoseconds())
+  let t = time::OffsetDateTime::now_utc();
+  (Rfc3339Time { inner: t, }, (t - time::OffsetDateTime::unix_epoch()).whole_nanoseconds())
 }

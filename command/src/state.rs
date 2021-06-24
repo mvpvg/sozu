@@ -3,9 +3,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::iter::{repeat,FromIterator};
-use certificate::calculate_fingerprint;
+use crate::certificate::calculate_fingerprint;
 
-use proxy::{Application,CertFingerprint,CertificateAndKey,ProxyRequestData,
+use crate::proxy::{Application,CertFingerprint,CertificateAndKey,ProxyRequestData,
   HttpFront,TcpFront,Backend,QueryAnswerApplication,
   AddCertificate, RemoveCertificate, RemoveBackend,
   HttpListener,HttpsListener,TcpListener,ListenerType,
@@ -798,7 +798,6 @@ pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(Strin
     .map(|(c, names)| (c.certificate.clone(), names.clone())).next()
 }
 
-use std::collections::btree_map::Iter;
 struct DiffMap<'a, K:Ord, V, I1, I2> {
   my_it: I1,
   other_it: I2,
@@ -867,8 +866,8 @@ impl<'a, K:Ord, V:PartialEq, I1: Iterator<Item=(K, &'a V)>, I2: Iterator<Item=(K
 #[cfg(test)]
 mod tests {
   use super::*;
-  use config::LoadBalancingAlgorithms;
-  use proxy::{ProxyRequestData,HttpFront,Backend,LoadBalancingParams,TlsProvider};
+  use crate::config::LoadBalancingAlgorithms;
+  use crate::proxy::{ProxyRequestData,HttpFront,Backend,LoadBalancingParams,TlsProvider};
 
   #[test]
   fn serialize() {
@@ -900,21 +899,21 @@ mod tests {
     state.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), address: "127.0.0.2:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), address: "192.167.1.2:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
-    state.handle_order(&ProxyRequestData::AddApplication(Application { app_id: String::from("app_2"), sticky_session: true, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::RoundRobin, answer_503: None }));
+    state.handle_order(&ProxyRequestData::AddApplication(Application { app_id: String::from("app_2"), sticky_session: true, https_redirect: true, proxy_protocol: None, load_balancing: LoadBalancingAlgorithms::RoundRobin, load_metric: None, answer_503: None }));
 
     let mut state2:ConfigState = Default::default();
     state2.handle_order(&ProxyRequestData::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), address: "0.0.0.0:8080".parse().unwrap() }));
     state2.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state2.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), address: "127.0.0.2:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state2.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), address: "127.0.0.2:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
-    state2.handle_order(&ProxyRequestData::AddApplication(Application { app_id: String::from("app_3"), sticky_session: false, https_redirect: false, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::RoundRobin, answer_503: None }));
+    state2.handle_order(&ProxyRequestData::AddApplication(Application { app_id: String::from("app_3"), sticky_session: false, https_redirect: false, proxy_protocol: None, load_balancing: LoadBalancingAlgorithms::RoundRobin, load_metric: None, answer_503: None }));
 
    let e = vec!(
      ProxyRequestData::RemoveHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), address: "0.0.0.0:8080".parse().unwrap() }),
      ProxyRequestData::RemoveBackend(RemoveBackend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), address: "192.167.1.2:1026".parse().unwrap() }),
      ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), address: "127.0.0.2:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None }),
      ProxyRequestData::RemoveApplication(String::from("app_2")),
-     ProxyRequestData::AddApplication(Application { app_id: String::from("app_3"), sticky_session: false, https_redirect: false, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::RoundRobin, answer_503: None }),
+     ProxyRequestData::AddApplication(Application { app_id: String::from("app_3"), sticky_session: false, https_redirect: false, proxy_protocol: None, load_balancing: LoadBalancingAlgorithms::RoundRobin, load_metric: None, answer_503: None }),
    );
    let expected_diff:HashSet<&ProxyRequestData> = HashSet::from_iter(e.iter());
 
@@ -1022,6 +1021,9 @@ mod tests {
       front: "0.0.0.0:1234".parse().unwrap(),
       public_address: None,
       expect_proxy: false,
+      front_timeout: 60,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       front: "0.0.0.0:1234".parse().unwrap(),
@@ -1035,6 +1037,10 @@ mod tests {
       answer_404: String::new(),
       answer_503: String::new(),
       sticky_name: String::new(),
+      front_timeout: 60,
+      request_timeout: 10,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state.handle_order(&ProxyRequestData::AddHttpsListener(HttpsListener {
       front: "0.0.0.0:8443".parse().unwrap(),
@@ -1050,6 +1056,10 @@ mod tests {
       certificate:         None,
       certificate_chain:   vec![],
       key:                 None,
+      front_timeout: 60,
+      request_timeout: 10,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       front: "0.0.0.0:8443".parse().unwrap(),
@@ -1062,6 +1072,9 @@ mod tests {
       front: "0.0.0.0:1234".parse().unwrap(),
       public_address: None,
       expect_proxy: true,
+      front_timeout: 60,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state2.handle_order(&ProxyRequestData::AddHttpListener(HttpListener {
       front: "0.0.0.0:8080".parse().unwrap(),
@@ -1070,6 +1083,10 @@ mod tests {
       answer_404: "test".to_string(),
       answer_503: String::new(),
       sticky_name: String::new(),
+      front_timeout: 60,
+      request_timeout: 10,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       front: "0.0.0.0:8080".parse().unwrap(),
@@ -1090,6 +1107,10 @@ mod tests {
       certificate:         None,
       certificate_chain:   vec![],
       key:                 None,
+      front_timeout: 60,
+      request_timeout: 10,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       front: "0.0.0.0:8443".parse().unwrap(),
@@ -1106,6 +1127,9 @@ mod tests {
         front: "0.0.0.0:1234".parse().unwrap(),
         public_address: None,
         expect_proxy: true,
+        front_timeout: 60,
+        back_timeout: 30,
+        connect_timeout: 3,
       }),
       ProxyRequestData::DeactivateListener(DeactivateListener {
         front: "0.0.0.0:1234".parse().unwrap(),
@@ -1123,6 +1147,10 @@ mod tests {
         answer_404: String::from("test"),
         answer_503: String::new(),
         sticky_name: String::new(),
+        front_timeout: 60,
+        request_timeout: 10,
+        back_timeout: 30,
+        connect_timeout: 3,
       }),
       ProxyRequestData::ActivateListener(ActivateListener {
         front: "0.0.0.0:8080".parse().unwrap(),
@@ -1147,6 +1175,10 @@ mod tests {
         certificate:         None,
         certificate_chain:   vec![],
         key:                 None,
+        front_timeout: 60,
+        request_timeout: 10,
+        back_timeout: 30,
+        connect_timeout: 3,
       }),
     );
 

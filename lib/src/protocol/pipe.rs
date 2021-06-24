@@ -1,13 +1,13 @@
 use std::net::SocketAddr;
 use mio::*;
-use mio::tcp::TcpStream;
-use mio::unix::UnixReady;
+use mio::net::*;
 use rusty_ulid::Ulid;
-use sozu_command::buffer::fixed::Buffer;
 use {SessionResult,Readiness,SessionMetrics};
+use sozu_command::ready::Ready;
 use socket::{SocketHandler,SocketResult,TransportProtocol};
 use pool::Checkout;
 use {Protocol, LogDuration};
+use timer::TimeoutContainer;
 
 #[derive(PartialEq)]
 pub enum SessionStatus {
@@ -41,6 +41,8 @@ pub struct Pipe<Front:SocketHandler> {
   protocol:           Protocol,
   frontend_status:    ConnectionStatus,
   backend_status:     ConnectionStatus,
+  pub front_timeout:  Option<TimeoutContainer>,
+  pub back_timeout:   Option<TimeoutContainer>,
 }
 
 impl<Front:SocketHandler> Pipe<Front> {
@@ -71,19 +73,21 @@ impl<Front:SocketHandler> Pipe<Front> {
       backend_id,
       request_id,
       websocket_context,
-      front_readiness:    Readiness {
-                            interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
-                            event: UnixReady::from(Ready::empty()),
+      front_readiness: Readiness {
+          interest: Ready::all(),
+          event: Ready::empty(),
       },
-      back_readiness:    Readiness {
-                            interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
-                            event: UnixReady::from(Ready::empty()),
+      back_readiness: Readiness {
+          interest: Ready::all(),
+          event: Ready::empty(),
       },
       log_ctx,
       session_address,
       protocol,
       frontend_status,
       backend_status,
+      front_timeout: None,
+      back_timeout: None,
     };
 
     trace!("created pipe");
@@ -101,6 +105,11 @@ impl<Front:SocketHandler> Pipe<Front> {
     self.frontend.socket_ref()
   }
 
+  pub fn front_socket_mut(&mut self) -> &mut TcpStream {
+    self.frontend.socket_mut()
+  }
+
+
   pub fn back_socket(&self)  -> Option<&TcpStream> {
     self.backend.as_ref()
   }
@@ -116,6 +125,32 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   pub fn back_token(&self)   -> Option<Token> {
     self.backend_token
+  }
+
+  pub fn timeout(&mut self, token: Token, _metrics: &mut SessionMetrics) -> SessionResult {
+      //info!("got timeout for token: {:?}", token);
+    if self.frontend_token == token {
+      if let Some(timeout) = self.front_timeout.as_mut() {
+        timeout.triggered();
+        SessionResult::CloseSession
+      } else {
+        SessionResult::CloseSession
+      }
+    } else if self.backend_token == Some(token) {
+        //info!("backend timeout triggered for token {:?}", token);
+        if let Some(timeout) = self.back_timeout.as_mut() {
+          timeout.triggered();
+        }
+        SessionResult::CloseSession
+    } else {
+        error!("got timeout for an invalid token");
+        SessionResult::CloseSession
+    }
+  }
+
+  pub fn cancel_timeouts(&mut self) {
+      self.front_timeout.as_mut().map(|t| t.cancel());
+      self.back_timeout.as_mut().map(|t| t.cancel());
   }
 
   pub fn close(&mut self) {
@@ -317,6 +352,12 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Read content from the session
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    if let Some(t) = self.front_timeout.as_mut() {
+      if !t.reset() {
+        error!("could not reset front timeout (pipe readable)");
+      }
+    }
+
     trace!("pipe readable");
     if self.front_buf.available_space() == 0 {
       self.front_readiness.interest.remove(Ready::readable());
@@ -467,6 +508,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   // Forward content to application
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("pipe back_writable");
+
     if self.front_buf.available_data() == 0 {
       self.front_readiness.interest.insert(Ready::readable());
       self.back_readiness.interest.remove(Ready::writable());
@@ -546,6 +588,12 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Read content from application
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    if let Some(t) = self.back_timeout.as_mut() {
+      if !t.reset() {
+        error!("could not reset back timeout");
+      }
+    }
+
     trace!("pipe back_readable");
     if self.back_buf.available_space() == 0 {
       self.back_readiness.interest.remove(Ready::readable());

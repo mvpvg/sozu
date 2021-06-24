@@ -67,11 +67,16 @@ handle_process_affinity = false
 # defaults to 10000 maximum connections
 max_connections = 500
 
-# maximum number of buffers used by the protocol implementations for active
-# connections (ie currently serving a request). For now, you should estimate
-# that max_buffers = number of concurrent requests * 2
+# maximum number of buffers in the pool used by the protocol implementations
+# for active connections (ie currently serving a request). For now, you should
+# estimate that max_buffers = number of concurrent requests * 2
 # defaults to 1000
-max_buffers = 500
+# max_buffers = 1000
+
+# minimum number of buffers preallocated in the pool
+# cannot be larger than max_buffers
+# defaults to 1
+# min_buffers = 1
 
 # size of the buffers used by the protocol implementations. Each worker will
 # preallocate max_buffers * 2 * buffer_size bytes, so you should plan for this
@@ -97,9 +102,21 @@ buffer_size = 16384
 tls_provider = "rustls"
 
 # maximum time of inactivity for a frontend socket, in seconds
-# defaults to 60 seconds
+# defaults to 60 seconds, can be specified at the listener level
 # front_timeout = 60
 
+# maximum time of inactivity for a backend socket, in seconds
+# defaults to 30 seconds, can be specified at the listener level
+# back_timeout = 30
+
+# maximum time to connect to a backend server, in seconds
+# defaults to 3 seconds, can be specified at the listener level
+# connect_timeout = 3
+
+# maximum time to receive a request since the connection started
+# defaults to 10 seconds, can be specified at the listener level
+# request_timeout = 10
+#
 # duration between zombie checks, in seconds
 # defaults to 30 minutes
 # in case of bugs in sozu's event loop and protocol implementations, some client
@@ -215,8 +232,10 @@ tls_versions = ["TLSv1.3"]
 protocol = "http"
 
 # per application load balancing algorithm. The possible values are
-# "roundrobin" and "random". Defaults to "roundrobin"
-# load_balancing_policy="roundrobin"
+# "round_robin", "random", "least_loaded" and "power_of_two". Defaults to "round_robin"
+load_balancing = "round_robin"
+# metric evaluating the load on the backend. available options: connections, requests, connection_time
+# load_metric = "connections"
 
 # frontends configuration
 # this specifies which listeners; domains, certificates that will be configured for an application

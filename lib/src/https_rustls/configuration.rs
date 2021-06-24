@@ -3,8 +3,6 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use mio::*;
 use mio::net::*;
-use mio_uds::UnixStream;
-use mio::unix::UnixReady;
 use std::os::unix::io::{AsRawFd};
 use std::io::ErrorKind;
 use std::collections::HashMap;
@@ -13,8 +11,7 @@ use std::net::SocketAddr;
 use std::str::from_utf8_unchecked;
 use rustls::{ServerConfig, ServerSession, NoClientAuth, ProtocolVersion,
   ALL_CIPHERSUITES};
-use mio_extras::timer::Timeout;
-use time::Duration;
+use time::{Duration, Instant};
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,
@@ -23,7 +20,7 @@ use sozu_command::proxy::{Application,
   TlsVersion,ProxyResponseData,Query, QueryCertificateType,QueryAnswer,
   QueryAnswerCertificate};
 use sozu_command::logging;
-use sozu_command::buffer::fixed::Buffer;
+use sozu_command::ready::Ready;
 
 use protocol::http::{parser::{RRequestLine,hostname_and_port}, answers::HttpAnswers};
 use pool::Pool;
@@ -119,13 +116,16 @@ impl Listener {
       return Some(self.token);
     }
 
-    let listener = tcp_listener.or_else(|| server_bind(&self.config.front).map_err(|e| {
+    let mut listener = tcp_listener.or_else(|| server_bind(&self.config.front).map_err(|e| {
       error!("could not create listener {:?}: {:?}", self.config.front, e);
     }).ok());
 
 
-    if let Some(ref sock) = listener {
-      if let Err(e) = event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge()) {
+    if let Some(ref mut sock) = listener {
+      if let Err(e) = event_loop.registry().register(
+          sock,
+          self.token, Interest::READABLE
+        ) {
         error!("error registering listen socket: {:?}", e);
       }
     } else {
@@ -170,7 +170,7 @@ impl Listener {
             f.path_begin == front.path_begin
           }) {
 
-          let front = fronts.remove(pos);
+          let _front = fronts.remove(pos);
         }
       }
 
@@ -362,8 +362,7 @@ impl Proxy {
 
     match res {
       Err(e) => {
-        let answer = self.get_service_unavailable_answer(Some(app_id), &session.listen_token);
-        session.set_answer(DefaultAnswerStatus::Answer503, answer);
+        session.set_answer(DefaultAnswerStatus::Answer503, None);
         Err(e)
       },
       Ok((backend, conn))  => {
@@ -397,8 +396,7 @@ impl Proxy {
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
-        let answer = self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
-        session.set_answer(DefaultAnswerStatus::Answer400, answer);
+        session.set_answer(DefaultAnswerStatus::Answer400, None);
         return Err(ConnectionError::InvalidHost);
       }
 
@@ -412,8 +410,7 @@ impl Proxy {
         .and_then(|h| h.frontend.session.get_sni_hostname()).map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
-        let answer = self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
-        unwrap_msg!(session.http_mut()).set_answer(DefaultAnswerStatus::Answer404, answer);
+        unwrap_msg!(session.http_mut()).set_answer(DefaultAnswerStatus::Answer404, None);
         return Err(ConnectionError::HostNotFound);
       }
 
@@ -426,8 +423,7 @@ impl Proxy {
       }
     } else {
       error!("hostname parsing failed");
-      let answer = self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
-      session.set_answer(DefaultAnswerStatus::Answer400, answer);
+      session.set_answer(DefaultAnswerStatus::Answer400, None);
       return Err(ConnectionError::InvalidHost);
     };
 
@@ -439,8 +435,7 @@ impl Proxy {
       .map(|ref front| front.app_id.clone()) {
       Some(app_id) => Ok(app_id),
       None => {
-        let answer = self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
-        session.set_answer(DefaultAnswerStatus::Answer404, answer);
+        session.set_answer(DefaultAnswerStatus::Answer404, None);
         Err(ConnectionError::HostNotFound)
       }
     }
@@ -449,17 +444,13 @@ impl Proxy {
   fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
     if session.connection_attempt == CONN_RETRIES {
       error!("{} max connection attempt reached", session.log_context());
-      let answer = self.get_service_unavailable_answer(session.app_id.as_ref().map(|app_id| app_id.as_str()), &session.listen_token);
-      session.set_answer(DefaultAnswerStatus::Answer503, answer);
+      session.set_answer(DefaultAnswerStatus::Answer503, None);
       Err(ConnectionError::NoBackendAvailable)
     } else {
       Ok(())
     }
   }
 
-  fn get_service_unavailable_answer(&self, app_id: Option<&str>, listen_token: &Token) -> Rc<Vec<u8>> {
-    self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer503, app_id)
-  }
 }
 
 impl ProxyConfiguration<Session> for Proxy {
@@ -467,19 +458,18 @@ impl ProxyConfiguration<Session> for Proxy {
     self.listeners.get_mut(&Token(token.0)).unwrap().accept(token)
   }
 
-  fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken,
-    poll: &mut Poll, session_token: Token, timeout: Timeout, delay: Duration)
+  fn create_session(&mut self, mut frontend_sock: TcpStream, token: ListenToken,
+    poll: &mut Poll, session_token: Token, wait_time: Duration)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
       if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
         if let Err(e) = frontend_sock.set_nodelay(true) {
           error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
         }
 
-        if let Err(e) = poll.register(
-          &frontend_sock,
+        if let Err(e) = poll.registry().register(
+          &mut frontend_sock,
           session_token,
-          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-          PollOpt::edge()
+          Interest::READABLE | Interest::WRITABLE
         ) {
           error!("error registering fron socket({:?}): {:?}", frontend_sock, e);
         }
@@ -488,7 +478,11 @@ impl ProxyConfiguration<Session> for Proxy {
         let c = Session::new(session, frontend_sock, session_token, Rc::downgrade(&self.pool),
           listener.config.public_address.unwrap_or(listener.config.front),
           listener.config.expect_proxy, listener.config.sticky_name.clone(),
-          timeout, listener.answers.clone(), Token(token.0), delay);
+          listener.answers.clone(), Token(token.0), wait_time,
+          Duration::seconds(listener.config.front_timeout as i64),
+          Duration::seconds(listener.config.back_timeout as i64),
+          Duration::seconds(listener.config.request_timeout as i64),
+          );
 
         Ok((Rc::new(RefCell::new(c)), false))
       } else {
@@ -518,6 +512,7 @@ impl ProxyConfiguration<Session> for Proxy {
         //matched on keepalive
         session.metrics.backend_id = session.backend.as_ref().map(|i| i.borrow().backend_id.clone());
         session.metrics.backend_start();
+        session.http_mut().map(|h| h.backend_data.as_mut().map(|b| b.borrow_mut().active_requests += 1));
         return Ok(BackendConnectAction::Reuse);
       } else if let Some(token) = session.back_token() {
         session.close_backend(token, poll);
@@ -541,7 +536,7 @@ impl ProxyConfiguration<Session> for Proxy {
     session.app_id = Some(app_id.clone());
 
     let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-    let socket = self.backend_from_request(session, &app_id, front_should_stick)?;
+    let mut socket = self.backend_from_request(session, &app_id, front_should_stick)?;
 
     session.http_mut().map(|http| {
       http.app_id = Some(app_id.clone());
@@ -552,35 +547,37 @@ impl ProxyConfiguration<Session> for Proxy {
       error!("error setting nodelay on back socket: {:?}", e);
     }
     session.back_readiness().map(|r| {
-      r.interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+      r.interest  = Ready::writable() | Ready::hup() | Ready::error();
     });
 
-    session.back_connected = BackendConnectionStatus::Connecting;
+    let connect_timeout = time::Duration::seconds(i64::from(self.listeners.get(&session.listen_token).as_ref().map(|l| l.config.connect_timeout).unwrap()));
+
+    session.back_connected = BackendConnectionStatus::Connecting(Instant::now());
     if let Some(back_token) = old_back_token {
       session.set_back_token(back_token);
-      if let Err(e) = poll.register(
-        &socket,
+      if let Err(e) = poll.registry().register(
+        &mut socket,
         back_token,
-        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-        PollOpt::edge()
+        Interest::READABLE | Interest::WRITABLE
       ) {
         error!("error registering back socket: {:?}", e);
       }
 
       session.set_back_socket(socket);
+      session.http_mut().map(|h| h.set_back_timeout(connect_timeout));
       Ok(BackendConnectAction::Replace)
     } else {
-      if let Err(e) = poll.register(
-        &socket,
+      if let Err(e) = poll.registry().register(
+        &mut socket,
         back_token,
-        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-        PollOpt::edge()
+        Interest::READABLE | Interest::WRITABLE
       ) {
         error!("error registering back socket: {:?}", e);
       }
 
       session.set_back_socket(socket);
       session.set_back_token(back_token);
+      session.http_mut().map(|h| h.set_back_timeout(connect_timeout));
       Ok(BackendConnectAction::New)
     }
   }
@@ -657,8 +654,8 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         for (_, l) in self.listeners.iter_mut() {
-          l.listener.take().map(|sock| {
-            if let Err(e) = event_loop.deregister(&sock) {
+          l.listener.take().map(|mut sock| {
+            if let Err(e) = event_loop.registry().deregister(&mut sock) {
               error!("error deregistering listen socket: {:?}", e);
             }
           });
@@ -668,8 +665,8 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::HardStop => {
         info!("{} hard shutdown", message.id);
         for (_, mut l) in self.listeners.drain() {
-          l.listener.take().map(|sock| {
-            if let Err(e) = event_loop.deregister(&sock) {
+          l.listener.take().map(|mut sock| {
+            if let Err(e) = event_loop.registry().deregister(&mut sock) {
               error!("error deregistering listen socket: {:?}", e);
             }
           });
@@ -733,31 +730,32 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   let mut event_loop  = Poll::new().expect("could not create event loop");
 
   let pool = Rc::new(RefCell::new(
-    Pool::with_capacity(2*max_buffers, buffer_size)
+    Pool::with_capacity(1, max_buffers, buffer_size)
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-  let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
+  let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>> = Slab::with_capacity(max_buffers);
   {
-    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-    info!("taking token {:?} for channel", entry.index());
+    let entry = sessions.vacant_entry();
+    info!("taking token {:?} for channel", SessionToken(entry.key()));
     entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
   }
   {
-    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-    info!("taking token {:?} for timer", entry.index());
+    let entry = sessions.vacant_entry();
+    info!("taking token {:?} for timer", SessionToken(entry.key()));
     entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
   }
   {
-    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-    info!("taking token {:?} for metrics", entry.index());
+    let entry = sessions.vacant_entry();
+    info!("taking token {:?} for metrics", SessionToken(entry.key()));
     entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
   }
 
   let token = {
-    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-    let e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
-    Token(e.index().0)
+    let entry = sessions.vacant_entry();
+    let key = entry.key();
+    let _e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
+    Token(key)
   };
 
   let front = config.front.clone();

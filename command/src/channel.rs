@@ -1,5 +1,5 @@
-use mio::{Evented,Poll,PollOpt,Ready,Token};
-use mio_uds::UnixStream;
+use mio::net::UnixStream;
+use mio::event::Source;
 use std::fmt::Debug;
 use std::iter::Iterator;
 use std::str::from_utf8;
@@ -12,7 +12,8 @@ use serde_json;
 use serde::ser::Serialize;
 use serde::de::DeserializeOwned;
 
-use buffer::growable::Buffer;
+use crate::buffer::growable::Buffer;
+use crate::ready::Ready;
 
 #[derive(Debug,PartialEq)]
 pub enum ConnError {
@@ -125,8 +126,11 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
 
       match self.sock.read(self.front_buf.space()) {
         Ok(0) => {
+          self.interest  = Ready::empty();
           self.readiness.remove(Ready::readable());
-          break;
+          //error!("read() returned 0 (count={})", count);
+          self.readiness.insert(Ready::hup());
+          return Err(ConnError::SocketError);
         },
         Err(e) => {
           match e.kind() {
@@ -168,7 +172,10 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
 
       match self.sock.write(self.back_buf.data()) {
         Ok(0) => {
-          break;
+          //error!("write() returned 0");
+          self.interest  = Ready::empty();
+          self.readiness.insert(Ready::hup());
+          return Err(ConnError::SocketError);
         },
         Ok(r) => {
           count += r;
@@ -261,6 +268,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
 
         match self.sock.read(self.front_buf.space()) {
           Ok(0) => {
+              return None;
           },
           Err(_) => { return None; },
           Ok(r) => {
@@ -347,6 +355,9 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
       }
 
       match self.sock.write(self.back_buf.data()) {
+        Ok(0) => {
+            return false;
+        },
         Ok(r) => {
           self.back_buf.consume(r);
         },
@@ -383,26 +394,25 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Iterator for Channel<Tx,Rx
   }
 }
 
-impl<Tx,Rx> Evented for Channel<Tx,Rx> {
-  fn register(&self,
-              poll: &Poll,
+use mio::{Interest, Registry, Token};
+impl<Tx,Rx> Source for Channel<Tx,Rx> {
+  fn register(&mut self,
+              registry: &Registry,
               token: Token,
-              interest: Ready,
-              opts: PollOpt)
+              interests: Interest)
               -> io::Result<()> {
-    self.sock.register(poll, token, interest, opts)
+    self.sock.register(registry, token, interests)
   }
 
-  fn reregister(&self,
-                poll: &Poll,
+  fn reregister(&mut self,
+                registry: &Registry,
                 token: Token,
-                interest: Ready,
-                opts: PollOpt)
+                interests: Interest)
                 -> io::Result<()> {
-    self.sock.reregister(poll, token, interest, opts)
+    self.sock.reregister(registry, token, interests)
   }
 
-  fn deregister(&self, poll: &Poll) -> io::Result<()> {
-    self.sock.deregister(poll)
+  fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+    self.sock.deregister(registry)
   }
 }
